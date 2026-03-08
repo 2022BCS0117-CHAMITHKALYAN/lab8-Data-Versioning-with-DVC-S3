@@ -1,1 +1,103 @@
+name: MLOps Pipeline
 
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  train-and-evaluate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install dvc[s3] pandas scikit-learn
+
+      - name: Configure AWS credentials
+        run: |
+          mkdir -p ~/.aws
+          echo "[default]" > ~/.aws/credentials
+          echo "aws_access_key_id=${{ secrets.AWS_ACCESS_KEY_ID }}" >> ~/.aws/credentials
+          echo "aws_secret_access_key=${{ secrets.AWS_SECRET_ACCESS_KEY }}" >> ~/.aws/credentials
+
+      - name: Pull dataset from DVC
+        run: dvc pull
+
+      - name: Generate dataset info
+        run: |
+          python -c "
+          import pandas as pd, json
+          df = pd.read_csv('data/housing.csv')
+          info = {
+              'dataset_rows': int(len(df)),
+              'dataset_columns': int(len(df.columns))
+          }
+          with open('dataset_info.json','w') as f:
+              json.dump(info,f)
+          print(info)
+          "
+
+      - name: Train model
+        run: python src/train.py
+
+      - name: Save previous metrics (if exists)
+        run: |
+          if git show HEAD~1:metrics.json > previous_metrics.json 2>/dev/null; then
+            echo 'Previous metrics found'
+          else
+            echo '{"rmse": 999999}' > previous_metrics.json
+          fi
+
+      - name: Compare model performance
+        id: compare
+        run: |
+          python -c "
+          import json, os
+          new = json.load(open('metrics.json'))
+          old = json.load(open('previous_metrics.json'))
+          print('New RMSE:', new['rmse'])
+          print('Old RMSE:', old['rmse'])
+          if new['rmse'] < old['rmse']:
+              print('Model improved')
+              with open(os.environ['GITHUB_ENV'],'a') as f:
+                  f.write('MODEL_IMPROVED=true\n')
+          else:
+              print('Model not improved')
+              with open(os.environ['GITHUB_ENV'],'a') as f:
+                  f.write('MODEL_IMPROVED=false\n')
+          "
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ml-results
+          path: |
+            metrics.json
+            dataset_info.json
+
+      - name: Build Docker image
+        if: env.MODEL_IMPROVED == 'true'
+        run: |
+          docker build -t ${{ secrets.DOCKER_USERNAME }}/mlops-housing-model:latest .
+
+      - name: Login to DockerHub
+        if: env.MODEL_IMPROVED == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Push Docker image
+        if: env.MODEL_IMPROVED == 'true'
+        run: |
+          docker push ${{ secrets.DOCKER_USERNAME }}/mlops-housing-model:latest
